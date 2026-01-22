@@ -1,6 +1,7 @@
 # Pierre Museum – Local Generative Art Terminal
 
 ![Physical setup of Pierre Museum](the-setup.jpg)
+![Physical setup of Pierre Museum 2](IMG_9578.jpg)
 
 Pierre Museum is a tiny local “gallery in a box”:
 
