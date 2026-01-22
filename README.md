@@ -323,6 +323,4 @@ When you click Previous/Next, the artist’s palette + global overlays change to
 
 ---
 
-## License
 
-Personal / TBD. Treat this as a personal art project unless you decide on an explicit license.
