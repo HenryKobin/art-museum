@@ -2,6 +2,7 @@
 import json
 import logging
 import random
+import re
 import subprocess
 import threading
 import time
@@ -158,12 +159,70 @@ def _llama_chat(system, user, max_tokens=200):
     return content.strip()
 
 
+# SDXL's text encoders read at most 75 prompt tokens; anything after that never reaches the image.
+# The style prefixes alone run 53-152 tokens, so "style, then scene" dropped most or all of the scene,
+# and the gallery note described a scene the image was never asked to show. The prompt is now the
+# scene first, kept short, followed by as many of the style's phrases as still fit.
+PROMPT_TOKEN_BUDGET = 56  # counts words and punctuation; measured to stay at or under 69 CLIP tokens
+SCENE_WORD_LIMIT = 25
+
+
+def _rough_tokens(text):
+    return len(re.findall(r"\w+|[^\w\s]", text))
+
+
+def _clean_label_value(text):
+    return text.strip().strip("[]").strip().strip('"“”').strip()
+
+
+def parse_title_and_scene(raw):
+    """Find TITLE and SCENE even when the model wraps them in brackets or puts both on one line."""
+    title_match = re.search(r"TITLE\s*:\s*(.+?)(?=\n|SCENE\s*:|$)", raw, re.IGNORECASE)
+    scene_match = re.search(r"SCENE\s*:\s*(.+)", raw, re.IGNORECASE | re.DOTALL)
+    title = _clean_label_value(title_match.group(1)) if title_match else ""
+    scene = _clean_label_value(scene_match.group(1).split("\n\n")[0]) if scene_match else ""
+    return title or "UNTITLED", " ".join(scene.split())
+
+
+def strip_leading_labels(note):
+    """Drop the short heading lines small models put before the note (the title, the artist's name)."""
+    lines = note.strip().splitlines()
+    while lines and (not lines[0].strip() or (len(lines[0].split()) <= 6 and not re.search(r"[.!?]$", lines[0].strip()))):
+        lines.pop(0)
+    return "\n".join(lines).strip() or note.strip()
+
+
+def finish_note(note):
+    """Keep the two paragraphs the prompt asks for, ending on a complete sentence; the token cap
+    often stops the model mid-sentence."""
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", note.strip()) if p.strip()][:2]
+    text = "\n\n".join(paragraphs)
+    complete = re.match(r"(.*[.!?][\"”’)]?)", text, re.DOTALL)
+    if complete and len(complete.group(1)) >= 0.4 * len(text):
+        text = complete.group(1)
+    return text or note.strip()
+
+
+def build_image_prompt(scene, style_prefix):
+    """Scene first and trimmed, then the style's phrases in order until the token budget is spent."""
+    words = scene.split()
+    scene = " ".join(words[:SCENE_WORD_LIMIT]).rstrip(",;:.") if words else scene
+    prompt = scene
+    for phrase in re.split(r"(?<=[,.])\s+", " ".join(style_prefix.split())):
+        candidate = f"{prompt}, {phrase.rstrip(',.')}" if prompt else phrase.rstrip(",.")
+        if _rough_tokens(candidate) > PROMPT_TOKEN_BUDGET:
+            break
+        prompt = candidate
+    return scene, prompt
+
+
 def run_llm(artist):
     """
     High-level orchestrator for a single artist:
       1) Call LLM with artist.scene_system_prompt to get TITLE + SCENE.
-      2) Call LLM with artist.commentary_system_prompt to get commentary.
-      3) Build final dict: {artist_id, title, image_prompt, commentary}.
+      2) Build the image prompt from the scene and as much of the style as fits.
+      3) Call LLM with artist.commentary_system_prompt to write about that same scene.
+      4) Build final dict: {artist_id, title, image_prompt, commentary}.
     """
     scene_system = artist["scene_system_prompt"]
     commentary_system = artist["commentary_system_prompt"]
@@ -171,39 +230,33 @@ def run_llm(artist):
     artist_id = artist["id"]
 
     # --------- Call 1: TITLE + SCENE (no style words) ---------
-    scene_user = "Invent one new artwork now. Follow the format exactly."
+    scene_user = (
+        "Invent one new artwork now. Follow the format exactly. "
+        f"Keep the SCENE to one sentence of at most {SCENE_WORD_LIMIT} words naming what is visible."
+    )
 
     raw_scene = _llama_chat(scene_system, scene_user, max_tokens=200)
-
-    title = "UNTITLED"
-    scene = ""
-
-    for line in raw_scene.splitlines():
-        u = line.strip()
-        if u.upper().startswith("TITLE:"):
-            title = u.split(":", 1)[1].strip() or "UNTITLED"
-        elif u.upper().startswith("SCENE:"):
-            scene = u.split(":", 1)[1].strip()
+    title, scene = parse_title_and_scene(raw_scene)
 
     if not scene:
         logging.warning("Could not parse SCENE from LLM output; using raw text.")
-        scene = raw_scene.strip()
+        scene = " ".join(raw_scene.split())
 
-    # Compose the full SD prompt by prepending the artist's fixed style
-    image_prompt = f"{style_prefix.strip()} {scene}"
+    # The note is written from exactly the scene the image model receives.
+    scene, image_prompt = build_image_prompt(scene, style_prefix)
 
-    # --------- Call 2: commentary based on TITLE + SCENE ---------
+    # --------- Call 2: commentary about what the image shows ---------
     commentary_user = (
         f"TITLE: {title}\n"
-        f"SCENE: {scene}\n\n"
-        "Write the gallery wall text / artist note for this piece. "
-        "Write in first person as the artist. Remember: "
-        "exactly TWO paragraphs, each 4–7 sentences, separated by a blank line. "
+        f"THE IMAGE SHOWS: {scene}\n\n"
+        "Write the gallery wall text / artist note for this piece, in first person as the artist. "
+        "Write about the things in the image as described above; do not invent other subjects. "
+        "Exactly TWO short paragraphs, each 2–4 sentences, separated by a blank line. "
         "Do not include labels or restate these instructions."
     )
 
     commentary_text = _llama_chat(commentary_system, commentary_user, max_tokens=260)
-    commentary = commentary_text.strip()
+    commentary = finish_note(strip_leading_labels(commentary_text))
 
     return {
         "artist_id": artist_id,
